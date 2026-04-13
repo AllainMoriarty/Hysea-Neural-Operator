@@ -1,0 +1,27 @@
+[project]
+name = "tsunami-mf"
+version = "0.1.0"
+description = "Multi-fidelity tsunami prediction: max height, arrival time, eta"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "h5py",
+    "scikit-learn",
+    "matplotlib",
+    "pandas",
+    "optuna",
+    "mlflow",
+    # physicsnemo is an NVIDIA package — install separately if not on PyPI:
+    # pip install physicsnemo  OR
+    # pip install --extra-index-url https://pypi.ngc.nvidia.com physicsnemo
+    "nvidia-physicsnemo[cu13,nn-extras]",
+]
+
+[tool.uv]
+# Uncomment if physicsnemo requires NVIDIA's index:
+# extra-index-url = ["https://pypi.ngc.nvidia.com"]
+
+[build-system]
+requires      = ["hatchling"]
+build-backend = "hatchling.build"
