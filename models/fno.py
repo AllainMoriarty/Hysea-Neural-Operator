@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from physicsnemo.models.fno import FNO
+from physicsnemo.models.fno.fno import FNO
 
 
 class MFFno(nn.Module):

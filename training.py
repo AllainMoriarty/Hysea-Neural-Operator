@@ -13,13 +13,33 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error, r2_score
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, Dataset
 from config import device
 from models import MFDeepONet, MFFno, MFPino
 
 
 # Data helpers 
+class _PairDataset(Dataset):
+    """Dataset wrapper for lazy HDF5 views (or any indexable pair of arrays)."""
+
+    def __init__(self, X, y):
+        self.X = X
+        self.y = y
+
+    def __len__(self):
+        return min(len(self.X), len(self.y))
+
+    def __getitem__(self, idx):
+        x = torch.tensor(self.X[idx], dtype=torch.float32)
+        y = torch.tensor(self.y[idx], dtype=torch.float32)
+        return x, y
+
+
 def make_loader(X, y, batch_size: int, shuffle: bool = True) -> DataLoader:
+    if getattr(X, "is_h5_view", False) or getattr(y, "is_h5_view", False):
+        ds = _PairDataset(X, y)
+        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, pin_memory=True)
+
     ds = TensorDataset(
         torch.tensor(X, dtype=torch.float32),
         torch.tensor(y, dtype=torch.float32),
@@ -30,10 +50,11 @@ def make_loader(X, y, batch_size: int, shuffle: bool = True) -> DataLoader:
 def val_rmse(model, model_type: str, X_val, y_val, aux, fidelity: str, batch: int = 32) -> float:
     model.eval()
     losses = []
+    loader = make_loader(X_val, y_val, batch_size=batch, shuffle=False)
     with torch.no_grad():
-        for i in range(0, len(X_val), batch):
-            Xb = torch.tensor(X_val[i:i+batch], dtype=torch.float32).to(device)
-            yb = torch.tensor(y_val[i:i+batch], dtype=torch.float32).to(device)
+        for Xb, yb in loader:
+            Xb = Xb.to(device)
+            yb = yb.to(device)
             pred = model(Xb, aux, fidelity=fidelity)
             if pred.dim() == 4:
                 pred = pred.squeeze(1).reshape(len(Xb), -1)
@@ -329,17 +350,22 @@ def evaluate(model, model_type: str, X_te, y_te_flat, aux, name: str, fidelity: 
     """Run inference on the test set and compute metrics."""
     model.eval()
     preds = []
+    trues = []
+    loader = make_loader(X_te, y_te_flat, batch_size=batch, shuffle=False)
     with torch.no_grad():
-        for i in range(0, len(X_te), batch):
-            Xb   = torch.tensor(X_te[i:i+batch], dtype=torch.float32).to(device)
+        for Xb, yb in loader:
+            Xb = Xb.to(device)
             pred = model(Xb, aux, fidelity=fidelity)
             if pred.dim() == 4:
                 pred = pred.reshape(len(Xb), -1)
             preds.append(pred.cpu().numpy())
+            if yb.dim() > 2:
+                trues.append(yb.reshape(len(yb), -1).cpu().numpy())
+            else:
+                trues.append(yb.cpu().numpy())
 
     pred_flat = np.concatenate(preds, axis=0)
-    true_flat = (y_te_flat.reshape(len(X_te), -1)
-                 if y_te_flat.ndim > 2 else y_te_flat)
+    true_flat = np.concatenate(trues, axis=0)
 
     if inverse_fn:
         pred_flat = inverse_fn(pred_flat)

@@ -16,7 +16,7 @@ import torch
 import optuna
 import mlflow
 from config import (
-    device,
+    device, DATA_PATHS,
     MLFLOW_TRACKING_URI, MLFLOW_EXPERIMENT_BASE,
     EPOCHS, OPTUNA_TRIALS, RANDOM_SEED,
 )
@@ -64,11 +64,11 @@ if __name__ == "__main__":
     mlflow.set_experiment(EXPERIMENT)
 
     #  Load data 
-    db   = load_dataset()
+    db   = load_dataset(target="arrival_times", lazy=True)
     nlat, nlon = db.NLAT, db.NLON
 
     # Build SWE grid info for PINO eikonal physics loss
-    lf_raw              = load_h5(DATA_PATHS["lf"])
+    lf_raw              = load_h5(DATA_PATHS["lf"], keys=["lon", "lat", "bathymetry"])
     grid_info, H_raw    = build_grid_info(lf_raw, db)
 
     # Per-fidelity inverse transforms (undo the /at_max normalisation)

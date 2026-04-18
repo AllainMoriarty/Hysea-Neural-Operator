@@ -15,12 +15,21 @@ dependencies = [
     # physicsnemo is an NVIDIA package — install separately if not on PyPI:
     # pip install physicsnemo  OR
     # pip install --extra-index-url https://pypi.ngc.nvidia.com physicsnemo
-    "nvidia-physicsnemo[cu13,nn-extras]",
+    "nvidia-physicsnemo[cu12,nn-extras]",
+    "nvidia-physicsnemo-sym"
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["tsunami_mf"]
 
 [tool.uv]
 # Uncomment if physicsnemo requires NVIDIA's index:
-# extra-index-url = ["https://pypi.ngc.nvidia.com"]
+extra-index-url = ["https://pypi.nvidia.com"]
+
+# This tells uv to provide torch when building the physicsnemo wheel
+[tool.uv.extra-build-dependencies]
+nvidia-physicsnemo = ["torch"]
+"nvidia-physicsnemo-sym" = ["torch"]
 
 [build-system]
 requires      = ["hatchling"]

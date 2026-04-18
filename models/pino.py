@@ -15,7 +15,7 @@ No top-level execution — functions and classes only.
 from __future__ import annotations
 import torch
 import torch.nn as nn
-from physicsnemo.models.fno import FNO
+from physicsnemo.models.fno.fno import FNO
 
 from .swe_residuals import swe_spatial_loss, eikonal_loss
 

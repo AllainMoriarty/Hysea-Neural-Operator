@@ -3,9 +3,9 @@ import torch
 
 # Dataset paths
 DATA_PATHS = {
-    "lf": "/datasets/dataset_5km.h5",
-    "mf": "/datasets/dataset_2km.h5",
-    "hf": "/datasets/dataset_1km.h5",
+    "lf": "./datasets/dataset_5km.h5",
+    "mf": "./datasets/dataset_2km.h5",
+    "hf": "./datasets/dataset_1km.h5",
 }
 
 # MLflow
