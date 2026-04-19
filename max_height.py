@@ -17,11 +17,16 @@ Memory design
 • Training is done via AMP + gradient accumulation in training.py.
 """
 import gc
+import os
 import numpy as np
 import pandas as pd
 import torch
 import optuna
 import mlflow
+
+# Reduce CUDA allocator fragmentation between Optuna trials.
+# Must be set before any CUDA allocations.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 from config import (
     device, DATA_PATHS,
@@ -87,6 +92,28 @@ if __name__ == "__main__":
     db   = load_dataset(target="max_height", lazy=True)
     nlat, nlon = db.NLAT, db.NLON
 
+    expected_npts = nlat * nlon
+    if db.q_sp.shape[0] != expected_npts:
+        raise ValueError(
+            f"q_sp has {db.q_sp.shape[0]} points, expected {expected_npts} from NLAT*NLON"
+        )
+
+    for fid in ["lf", "mf", "hf"]:
+        y_flat = getattr(db, f"ymh_{fid}")["tr"][0]
+        y_2d = getattr(db, f"ymh2d_{fid}")["tr"][0]
+
+        flat_width = y_flat.shape[-1] if y_flat.ndim > 1 else y_flat.shape[0]
+        if flat_width != expected_npts:
+            raise ValueError(
+                f"ymh_{fid} width {flat_width} does not match expected {expected_npts}"
+            )
+
+        spatial_hw = y_2d.shape[-2:]
+        if spatial_hw != (nlat, nlon):
+            raise ValueError(
+                f"ymh2d_{fid} shape {spatial_hw} does not match expected {(nlat, nlon)}"
+            )
+
     # Build SWE grid info for PINO physics loss
     lf_raw              = load_h5(DATA_PATHS["lf"], keys=["lon", "lat", "bathymetry"])
     grid_info, H_raw    = build_grid_info(lf_raw, db)
@@ -132,6 +159,8 @@ if __name__ == "__main__":
                 db.bathy_t, nlat, nlon,
             ),
             n_trials=OPTUNA_TRIALS, show_progress_bar=True,
+            # Skip OOM trials instead of crashing the whole tuning run.
+            catch=(torch.cuda.OutOfMemoryError, RuntimeError),
         )
         best_fno = study_fno.best_params
         mlflow.log_params(best_fno)
@@ -153,6 +182,8 @@ if __name__ == "__main__":
                 db.bathy_t, nlat, nlon,
             ),
             n_trials=OPTUNA_TRIALS, show_progress_bar=True,
+            # Skip OOM trials instead of crashing the whole tuning run.
+            catch=(torch.cuda.OutOfMemoryError, RuntimeError),
         )
         best_pino = study_pino.best_params
         mlflow.log_params(best_pino)

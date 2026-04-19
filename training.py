@@ -140,13 +140,20 @@ def make_objective_fno(X_tr, y_tr, X_va, y_va, bathy_t, nlat: int, nlon: int,
                         epochs: int = 15):
     """Return an Optuna objective closure for MFFno."""
     def objective(trial):
-        latent = trial.suggest_categorical("latent_channels",    [16, 32, 64])
-        layers = trial.suggest_int("num_fno_layers",              2, 6)
-        modes  = trial.suggest_categorical("num_fno_modes",      [8, 16, 24])
-        dec_sz = trial.suggest_categorical("decoder_layer_size", [64, 128, 256])
+        # Flush fragmented CUDA cache from previous trial before allocating.
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Search space capped for 349x780 grid:
+        #   decoder (B * NLAT * NLON, dec_sz) at B=4, dec_sz=128 → ~540 MB/layer
+        #   latent=64, modes=16, batch=8 → OOM confirmed on 31 GiB GPU
+        latent = trial.suggest_categorical("latent_channels",    [16, 32])
+        layers = trial.suggest_int("num_fno_layers",              2, 4)
+        modes  = trial.suggest_categorical("num_fno_modes",      [8, 12])
+        dec_sz = trial.suggest_categorical("decoder_layer_size", [64, 128])
         lr     = trial.suggest_float("lr", 1e-4, 5e-3, log=True)
         wd     = trial.suggest_float("wd", 1e-6, 1e-3, log=True)
-        batch  = trial.suggest_categorical("batch", [4, 8, 16])
+        batch  = trial.suggest_categorical("batch", [2, 4])
 
         model  = MFFno(nlat=nlat, nlon=nlon,
                        latent_channels=latent, num_fno_layers=layers,
@@ -182,13 +189,18 @@ def make_objective_pino(X_tr, y_tr, X_va, y_va, bathy_t, nlat: int, nlon: int,
                          epochs: int = 15):
     """Return an Optuna objective closure for MFPino (tunes lambda_pde too)."""
     def objective(trial):
-        latent     = trial.suggest_categorical("latent_channels",    [16, 32, 64])
-        layers     = trial.suggest_int("num_fno_layers",              2, 6)
-        modes      = trial.suggest_categorical("num_fno_modes",      [8, 16, 24])
-        dec_sz     = trial.suggest_categorical("decoder_layer_size", [64, 128, 256])
+        # Flush fragmented CUDA cache from previous trial before allocating.
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Same conservative search space as FNO — PINO has identical backbone.
+        latent     = trial.suggest_categorical("latent_channels",    [16, 32])
+        layers     = trial.suggest_int("num_fno_layers",              2, 4)
+        modes      = trial.suggest_categorical("num_fno_modes",      [8, 12])
+        dec_sz     = trial.suggest_categorical("decoder_layer_size", [64, 128])
         lr         = trial.suggest_float("lr",          1e-4, 5e-3, log=True)
         wd         = trial.suggest_float("wd",          1e-6, 1e-3, log=True)
-        batch      = trial.suggest_categorical("batch", [4, 8, 16])
+        batch      = trial.suggest_categorical("batch", [2, 4])
         lambda_pde = trial.suggest_float("lambda_pde",  1e-4, 1e-1, log=True)
 
         model  = MFPino(nlat=nlat, nlon=nlon,
@@ -381,15 +393,19 @@ def train_mf_pino(model: MFPino, lf_data, mf_data, hf_data, aux,
                 yb = yb.to(device, non_blocking=True)
 
                 with autocast("cuda", dtype=torch.bfloat16, enabled=USE_AMP):
-                    pred = model(Xb, aux, fidelity=fidelity)
-                    if pred.dim() == 4:
-                        pred = pred.squeeze(1)
-                        yb   = yb.squeeze(1) if yb.dim() == 4 else yb
-                    data_loss = F.mse_loss(pred, yb)
+                    pred_full = model(Xb, aux, fidelity=fidelity)
+                    pred_loss = pred_full
+                    yb_loss = yb
+
+                    if pred_loss.dim() == 4 and pred_loss.shape[1] == 1:
+                        pred_loss = pred_loss.squeeze(1)
+                        yb_loss = yb_loss.squeeze(1) if yb_loss.dim() == 4 else yb_loss
+
+                    data_loss = F.mse_loss(pred_loss, yb_loss)
                     if physics:
                         # Pass pre-computed pred to avoid a second full forward pass
                         phys_loss = model.pino_physics_loss(
-                            Xb, aux, fidelity=fidelity, pred=pred
+                            Xb, aux, fidelity=fidelity, pred=pred_full
                         )
                         loss = (data_loss + lambda_pde * phys_loss) / GRAD_ACCUM_STEPS
                     else:
@@ -511,11 +527,19 @@ def evaluate(model, model_type: str, X_te, y_te_flat, aux, name: str,
 
 def plot_maps(result: dict, lon, lat, nlat: int, nlon: int,
               out_path: str = None, n: int = 3):
-    """Plot true / predicted / error spatial maps for n test samples."""
+    """Plot true / predicted / error spatial maps for up to n test samples."""
     p2d = result["pred"].reshape(-1, nlat, nlon)
     t2d = result["true"].reshape(-1, nlat, nlon)
-    fig, axes = plt.subplots(n, 3, figsize=(18, 5 * n))
-    for i in range(n):
+
+    n_avail = min(len(p2d), len(t2d))
+    n_plot = min(n, n_avail)
+    if n_plot == 0:
+        return None
+
+    fig, axes = plt.subplots(n_plot, 3, figsize=(18, 5 * n_plot))
+    axes = np.atleast_2d(axes)
+
+    for i in range(n_plot):
         vmax = max(float(t2d[i].max()), float(p2d[i].max()))
         for ax, data, title in zip(
             axes[i],

@@ -2,6 +2,7 @@ from __future__ import annotations
 import gc
 import numpy as np
 import torch
+import torch.nn.functional as F
 import h5py
 from dataclasses import dataclass
 from typing import Any, Dict
@@ -19,7 +20,8 @@ def load_h5(path: str, keys: list[str] | None = None) -> dict:
         return {k: hf[k][:] for k in keys}
 
 
-def preprocess(data: dict, feat_scaler=None, fit: bool = False, target: str = "all"):
+def preprocess(data: dict, feat_scaler=None, fit: bool = False, target: str = "all",
+               mh_out_hw: tuple[int, int] | None = None):
     """
     Scale features and normalise targets.
 
@@ -50,7 +52,7 @@ def preprocess(data: dict, feat_scaler=None, fit: bool = False, target: str = "a
     N = len(X)
 
     if target in ("all", "max_height"):
-        mh = data["max_height"].astype(np.float32)
+        mh = _resize_2d_fields(data["max_height"], mh_out_hw)
         out["ymh"]   = np.log1p(np.clip(mh, 0, 50).reshape(N, -1)).astype(np.float32)
         out["ymh2d"] = np.log1p(np.clip(mh, 0, 50)).astype(np.float32)[:, None]
 
@@ -178,19 +180,57 @@ def _transform_features_factory(mean: np.ndarray, std: np.ndarray):
     return _transform
 
 
-def _transform_mh_flat(arr):
+def _resize_2d_fields(arr, out_hw: tuple[int, int] | None, chunk_size: int = 64):
+    """
+    Resize 2-D fields to (H, W) while preserving sample axis when present.
+
+    Accepted shapes:
+      (H, W)      single sample
+      (N, H, W)   batched samples
+    """
     y = np.asarray(arr, dtype=np.float32)
+    if out_hw is None:
+        return np.ascontiguousarray(y, dtype=np.float32)
+
+    out_h, out_w = out_hw
     if y.ndim == 2:
-        return np.log1p(np.clip(y, 0, 50)).reshape(-1).astype(np.float32)
-    return np.log1p(np.clip(y, 0, 50)).reshape(y.shape[0], -1).astype(np.float32)
+        if y.shape == (out_h, out_w):
+            return np.ascontiguousarray(y, dtype=np.float32)
+        t = torch.from_numpy(y).unsqueeze(0).unsqueeze(0)
+        r = F.interpolate(t, size=out_hw, mode="bilinear", align_corners=False)
+        return np.ascontiguousarray(r.squeeze(0).squeeze(0).cpu().numpy(), dtype=np.float32)
+
+    if y.ndim == 3:
+        if y.shape[-2:] == (out_h, out_w):
+            return np.ascontiguousarray(y, dtype=np.float32)
+        out = np.empty((y.shape[0], out_h, out_w), dtype=np.float32)
+        for i in range(0, y.shape[0], chunk_size):
+            blk = torch.from_numpy(y[i:i + chunk_size]).unsqueeze(1)
+            rb = F.interpolate(blk, size=out_hw, mode="bilinear", align_corners=False)
+            out[i:i + chunk_size] = rb.squeeze(1).cpu().numpy().astype(np.float32, copy=False)
+        return np.ascontiguousarray(out, dtype=np.float32)
+
+    raise ValueError(f"Expected 2D or 3D max_height array, got shape {y.shape}")
 
 
-def _transform_mh_2d(arr):
-    y = np.asarray(arr, dtype=np.float32)
-    y = np.log1p(np.clip(y, 0, 50)).astype(np.float32)
-    if y.ndim == 2:
-        return y[None, ...]
-    return y[:, None, ...]
+def _transform_mh_flat_factory(out_hw: tuple[int, int] | None = None):
+    def _transform(arr):
+        y = _resize_2d_fields(arr, out_hw)
+        y = np.log1p(np.clip(y, 0, 50)).astype(np.float32)
+        if y.ndim == 2:
+            return np.ascontiguousarray(y.reshape(-1), dtype=np.float32)
+        return np.ascontiguousarray(y.reshape(y.shape[0], -1), dtype=np.float32)
+    return _transform
+
+
+def _transform_mh_2d_factory(out_hw: tuple[int, int] | None = None):
+    def _transform(arr):
+        y = _resize_2d_fields(arr, out_hw)
+        y = np.log1p(np.clip(y, 0, 50)).astype(np.float32)
+        if y.ndim == 2:
+            return np.ascontiguousarray(y[None, ...], dtype=np.float32)
+        return np.ascontiguousarray(y[:, None, ...], dtype=np.float32)
+    return _transform
 
 
 def _transform_at_flat_factory(scale: float):
@@ -397,6 +437,12 @@ def load_dataset(target: str = "all", lazy: bool = True) -> DataBundle:
             else:
                 _, NLAT, NLON = hf_lf["max_height"].shape
                 NTIME = int(hf_lf["time"].shape[0])
+            if target == "max_height":
+                mf_nlat, mf_nlon = hf_mf["max_height"].shape[-2:]
+                hf_nlat, hf_nlon = hf_hf["max_height"].shape[-2:]
+            else:
+                mf_nlat = hf_nlat = NLAT
+                mf_nlon = hf_nlon = NLON
             NTIME = int(hf_lf["time"].shape[0])
             lon = hf_lf["lon"][:]
             lat = hf_lf["lat"][:]
@@ -439,6 +485,10 @@ def load_dataset(target: str = "all", lazy: bool = True) -> DataBundle:
         print("Loading datasets…")
         print(f"LF:{n_lf}  MF:{n_mf}  HF:{n_hf}")
         print(f"Grid: ({NLAT}×{NLON})  Time steps: {NTIME}")
+        if target == "max_height":
+            print("Native max_height grids: "
+                  f"LF({NLAT}×{NLON})  MF({mf_nlat}×{mf_nlon})  HF({hf_nlat}×{hf_nlon})")
+            print(f"Canonical max_height grid: LF ({NLAT}×{NLON})")
         print(f"LF  train:{len(lf_tr)}  val:{len(lf_va)}  test:{len(lf_te)}")
         print(f"MF  train:{len(mf_tr)}  val:{len(mf_va)}  test:{len(mf_te)}")
         print(f"HF  train:{len(hf_tr)}  val:{len(hf_va)}  test:{len(hf_te)}")
@@ -447,12 +497,16 @@ def load_dataset(target: str = "all", lazy: bool = True) -> DataBundle:
         scaler_stub = {"mean": mean, "std": std}
 
         if target == "max_height":
-            ymh_lf = _pack_views(DATA_PATHS["lf"], lf_tr, lf_va, lf_te, "max_height", _transform_mh_flat)
-            ymh_mf = _pack_views(DATA_PATHS["mf"], mf_tr, mf_va, mf_te, "max_height", _transform_mh_flat)
-            ymh_hf = _pack_views(DATA_PATHS["hf"], hf_tr, hf_va, hf_te, "max_height", _transform_mh_flat)
-            ymh2d_lf = _pack_views(DATA_PATHS["lf"], lf_tr, lf_va, lf_te, "max_height", _transform_mh_2d)
-            ymh2d_mf = _pack_views(DATA_PATHS["mf"], mf_tr, mf_va, mf_te, "max_height", _transform_mh_2d)
-            ymh2d_hf = _pack_views(DATA_PATHS["hf"], hf_tr, hf_va, hf_te, "max_height", _transform_mh_2d)
+            canonical_hw = (NLAT, NLON)
+            mh_tf_flat = _transform_mh_flat_factory(canonical_hw)
+            mh_tf_2d = _transform_mh_2d_factory(canonical_hw)
+
+            ymh_lf = _pack_views(DATA_PATHS["lf"], lf_tr, lf_va, lf_te, "max_height", mh_tf_flat)
+            ymh_mf = _pack_views(DATA_PATHS["mf"], mf_tr, mf_va, mf_te, "max_height", mh_tf_flat)
+            ymh_hf = _pack_views(DATA_PATHS["hf"], hf_tr, hf_va, hf_te, "max_height", mh_tf_flat)
+            ymh2d_lf = _pack_views(DATA_PATHS["lf"], lf_tr, lf_va, lf_te, "max_height", mh_tf_2d)
+            ymh2d_mf = _pack_views(DATA_PATHS["mf"], mf_tr, mf_va, mf_te, "max_height", mh_tf_2d)
+            ymh2d_hf = _pack_views(DATA_PATHS["hf"], hf_tr, hf_va, hf_te, "max_height", mh_tf_2d)
             yat_lf = yat_mf = yat_hf = e()
             yat2d_lf = yat2d_mf = yat2d_hf = e()
             yeta_lf = yeta_mf = yeta_hf = e()
@@ -546,8 +600,9 @@ def load_dataset(target: str = "all", lazy: bool = True) -> DataBundle:
     else:
         _, _, NLAT, NLON = lf_raw["eta"].shape
     NTIME = int(len(lf_raw["time"]))
+    mh_out_hw = (NLAT, NLON) if target in ("all", "max_height") else None
 
-    lf_proc   = preprocess(lf_raw, fit=True, target=target)
+    lf_proc   = preprocess(lf_raw, fit=True, target=target, mh_out_hw=mh_out_hw)
     s_lf_map  = _split_processed(lf_proc)
     feat_scaler = lf_proc["feat_scaler"]
     at_lf, eta_lf = float(lf_proc["at_max"]), float(lf_proc["eta_max"])
@@ -563,7 +618,8 @@ def load_dataset(target: str = "all", lazy: bool = True) -> DataBundle:
 
     # MF
     mf_raw = load_h5(DATA_PATHS["mf"], keys=["features", *target_keys])
-    mf_proc  = preprocess(mf_raw, feat_scaler=feat_scaler, target=target)
+    mf_hw = tuple(mf_raw["max_height"].shape[-2:]) if "max_height" in mf_raw else None
+    mf_proc  = preprocess(mf_raw, feat_scaler=feat_scaler, target=target, mh_out_hw=mh_out_hw)
     s_mf_map = _split_processed(mf_proc)
     at_mf, eta_mf = float(mf_proc["at_max"]), float(mf_proc["eta_max"])
     n_mf = mf_proc["X"].shape[0]
@@ -573,7 +629,8 @@ def load_dataset(target: str = "all", lazy: bool = True) -> DataBundle:
 
     # HF
     hf_raw = load_h5(DATA_PATHS["hf"], keys=["features", *target_keys])
-    hf_proc  = preprocess(hf_raw, feat_scaler=feat_scaler, target=target)
+    hf_hw = tuple(hf_raw["max_height"].shape[-2:]) if "max_height" in hf_raw else None
+    hf_proc  = preprocess(hf_raw, feat_scaler=feat_scaler, target=target, mh_out_hw=mh_out_hw)
     s_hf_map = _split_processed(hf_proc)
     at_hf, eta_hf = float(hf_proc["at_max"]), float(hf_proc["eta_max"])
     n_hf = hf_proc["X"].shape[0]
@@ -583,6 +640,10 @@ def load_dataset(target: str = "all", lazy: bool = True) -> DataBundle:
 
     print(f"LF:{n_lf}  MF:{n_mf}  HF:{n_hf}")
     print(f"Grid: ({NLAT}×{NLON})  Time steps: {NTIME}")
+    if target in ("all", "max_height") and mf_hw is not None and hf_hw is not None:
+        print("Native max_height grids: "
+              f"LF({NLAT}×{NLON})  MF({mf_hw[0]}×{mf_hw[1]})  HF({hf_hw[0]}×{hf_hw[1]})")
+        print(f"Canonical max_height grid: LF ({NLAT}×{NLON})")
     print(f"LF  train:{len(s_lf_map['X']['tr'])}  val:{len(s_lf_map['X']['va'])}  test:{len(s_lf_map['X']['te'])}")
     print(f"MF  train:{len(s_mf_map['X']['tr'])}  val:{len(s_mf_map['X']['va'])}  test:{len(s_mf_map['X']['te'])}")
     print(f"HF  train:{len(s_hf_map['X']['tr'])}  val:{len(s_hf_map['X']['va'])}  test:{len(s_hf_map['X']['te'])}")

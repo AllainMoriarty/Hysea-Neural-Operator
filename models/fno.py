@@ -131,18 +131,19 @@ class MFFno(nn.Module):
                 fidelity: str = "hf") -> torch.Tensor:
         x = self._build_input(fault_params, bathy_t)
 
-        # Gradient checkpointing on the primary backbone:
-        # recomputes activations during backward instead of storing them,
-        # saving ~60 % VRAM from activations at ~25 % speed cost.
-        if GRAD_CKPT and self.training:
-            lf_out = _grad_ckpt(self.fno, x, use_reentrant=False)
-        else:
-            lf_out = self.fno(x)
-
-        if fidelity == "lf":
-            return lf_out
-        mf_out = lf_out + torch.sigmoid(self.alpha_mf) * self.mf_correction(x)
-        if fidelity == "mf":
-            return mf_out
-        hf_out = mf_out + torch.sigmoid(self.alpha_hf) * self.hf_correction(x)
+        # physicsnemo's spectral_layers.rfft2 does NOT support BF16/FP16.
+        # Disable autocast for all FNO calls so they always run in float32,
+        # while AMP remains active for the outer training loop.
+        with torch.amp.autocast("cuda", enabled=False):
+            x32 = x.float()
+            if GRAD_CKPT and self.training:
+                lf_out = _grad_ckpt(self.fno, x32, use_reentrant=False)
+            else:
+                lf_out = self.fno(x32)
+            if fidelity == "lf":
+                return lf_out
+            mf_out = lf_out + torch.sigmoid(self.alpha_mf) * self.mf_correction(x32)
+            if fidelity == "mf":
+                return mf_out
+            hf_out = mf_out + torch.sigmoid(self.alpha_hf) * self.hf_correction(x32)
         return hf_out
