@@ -3,8 +3,20 @@ Training loops, Optuna objective factories, evaluation and visualisation.
 
 No top-level execution — all public names are pure functions.
 No MLflow calls — logging is the caller's responsibility (task scripts).
+
+Memory optimisations applied
+-----------------------------
+• AMP (BF16)               : autocast + GradScaler on all training loops
+• Gradient accumulation    : GRAD_ACCUM_STEPS micro-batches per optimizer step
+• CPU best-state snapshot  : model checkpoint stored in CPU RAM, not VRAM
+• Cache flush              : gc.collect() + cuda.empty_cache() between stages
+• non_blocking transfers   : overlaps H2D copy with computation
+• DataLoader               : pin_memory=False, spawn-safe num_workers
+• val_rmse / evaluate      : AMP autocast during inference
+• PINO physics loss        : reuses pre-computed pred (no double forward)
 """
 from __future__ import annotations
+import gc
 import numpy as np
 import torch
 import torch.nn as nn
@@ -14,11 +26,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error, r2_score
 from torch.utils.data import DataLoader, TensorDataset, Dataset
-from config import device
+from torch.amp import autocast, GradScaler
+from config import (
+    device,
+    USE_AMP, GRAD_ACCUM_STEPS, NUM_WORKERS, PIN_MEMORY, PREFETCH_FACTOR,
+)
 from models import MFDeepONet, MFFno, MFPino
 
 
-# Data helpers 
+# ── Data helpers ──────────────────────────────────────────────────────────────
+
 class _PairDataset(Dataset):
     """Dataset wrapper for lazy HDF5 views (or any indexable pair of arrays)."""
 
@@ -36,36 +53,53 @@ class _PairDataset(Dataset):
 
 
 def make_loader(X, y, batch_size: int, shuffle: bool = True) -> DataLoader:
+    """Build a DataLoader from either H5FieldViews or plain numpy arrays."""
+    pf = PREFETCH_FACTOR if NUM_WORKERS > 0 else None
+    pw = NUM_WORKERS > 0
+
     if getattr(X, "is_h5_view", False) or getattr(y, "is_h5_view", False):
         ds = _PairDataset(X, y)
-        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, pin_memory=True)
+    else:
+        ds = TensorDataset(
+            torch.tensor(X, dtype=torch.float32),
+            torch.tensor(y, dtype=torch.float32),
+        )
 
-    ds = TensorDataset(
-        torch.tensor(X, dtype=torch.float32),
-        torch.tensor(y, dtype=torch.float32),
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        pin_memory=PIN_MEMORY,
+        num_workers=NUM_WORKERS,
+        prefetch_factor=pf,
+        persistent_workers=pw,
     )
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, pin_memory=True)
 
 
-def val_rmse(model, model_type: str, X_val, y_val, aux, fidelity: str, batch: int = 32) -> float:
+def val_rmse(model, model_type: str, X_val, y_val, aux, fidelity: str,
+             batch: int = 32) -> float:
     model.eval()
     losses = []
     loader = make_loader(X_val, y_val, batch_size=batch, shuffle=False)
     with torch.no_grad():
         for Xb, yb in loader:
-            Xb = Xb.to(device)
-            yb = yb.to(device)
-            pred = model(Xb, aux, fidelity=fidelity)
-            if pred.dim() == 4:
-                pred = pred.squeeze(1).reshape(len(Xb), -1)
-                yb   = yb.squeeze(1).reshape(len(Xb), -1) if yb.dim() == 4 else yb
-            losses.append(F.mse_loss(pred, yb).item())
+            Xb = Xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
+            with autocast("cuda", dtype=torch.bfloat16, enabled=USE_AMP):
+                pred = model(Xb, aux, fidelity=fidelity)
+                if pred.dim() == 4:
+                    pred = pred.squeeze(1).reshape(len(Xb), -1)
+                    yb   = yb.squeeze(1).reshape(len(Xb), -1) if yb.dim() == 4 else yb
+            # MSE in float32 for stability
+            losses.append(F.mse_loss(pred.float(), yb.float()).item())
     return float(np.mean(losses)) ** 0.5
 
 
-# Optuna objective factories
+# ── Optuna objective factories ────────────────────────────────────────────────
 # Each factory returns a closure that captures its dataset arguments.
-def make_objective_deeponet(X_tr, y_tr, X_va, y_va, q, trunk_dim: int = 2, epochs: int = 20):
+
+def make_objective_deeponet(X_tr, y_tr, X_va, y_va, q, trunk_dim: int = 2,
+                             epochs: int = 20):
     """Return an Optuna objective closure for MFDeepONet."""
     def objective(trial):
         p      = trial.suggest_categorical("p",      [64, 128, 256])
@@ -76,22 +110,34 @@ def make_objective_deeponet(X_tr, y_tr, X_va, y_va, q, trunk_dim: int = 2, epoch
 
         model  = MFDeepONet(p=p, hidden=hidden, trunk_dim=trunk_dim).to(device)
         opt    = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+        scaler = GradScaler(enabled=USE_AMP)
         loader = make_loader(X_tr, y_tr, batch)
 
         model.train()
         for _ in range(epochs):
-            for Xb, yb in loader:
-                Xb, yb = Xb.to(device), yb.to(device)
-                opt.zero_grad()
-                F.mse_loss(model(Xb, q, fidelity="lf"), yb).backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
+            opt.zero_grad()
+            for i, (Xb, yb) in enumerate(loader):
+                Xb, yb = Xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+                with autocast("cuda", dtype=torch.bfloat16, enabled=USE_AMP):
+                    loss = F.mse_loss(model(Xb, q, fidelity="lf"), yb) / GRAD_ACCUM_STEPS
+                scaler.scale(loss).backward()
+                if (i + 1) % GRAD_ACCUM_STEPS == 0 or (i + 1) == len(loader):
+                    scaler.unscale_(opt)
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(opt)
+                    scaler.update()
+                    opt.zero_grad()
 
-        return val_rmse(model, "deeponet", X_va, y_va, q, "lf")
+        result = val_rmse(model, "deeponet", X_va, y_va, q, "lf")
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+        return result
     return objective
 
 
-def make_objective_fno(X_tr, y_tr, X_va, y_va, bathy_t, nlat: int, nlon: int, epochs: int = 15):
+def make_objective_fno(X_tr, y_tr, X_va, y_va, bathy_t, nlat: int, nlon: int,
+                        epochs: int = 15):
     """Return an Optuna objective closure for MFFno."""
     def objective(trial):
         latent = trial.suggest_categorical("latent_channels",    [16, 32, 64])
@@ -100,28 +146,40 @@ def make_objective_fno(X_tr, y_tr, X_va, y_va, bathy_t, nlat: int, nlon: int, ep
         dec_sz = trial.suggest_categorical("decoder_layer_size", [64, 128, 256])
         lr     = trial.suggest_float("lr", 1e-4, 5e-3, log=True)
         wd     = trial.suggest_float("wd", 1e-6, 1e-3, log=True)
-        batch  = trial.suggest_categorical("batch", [8, 16, 32])
+        batch  = trial.suggest_categorical("batch", [4, 8, 16])
 
         model  = MFFno(nlat=nlat, nlon=nlon,
                        latent_channels=latent, num_fno_layers=layers,
                        num_fno_modes=modes, decoder_layer_size=dec_sz).to(device)
         opt    = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+        scaler = GradScaler(enabled=USE_AMP)
         loader = make_loader(X_tr, y_tr, batch)
 
         model.train()
         for _ in range(epochs):
-            for Xb, yb in loader:
-                Xb, yb = Xb.to(device), yb.to(device)
-                opt.zero_grad()
-                F.mse_loss(model(Xb, bathy_t, fidelity="lf"), yb).backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
+            opt.zero_grad()
+            for i, (Xb, yb) in enumerate(loader):
+                Xb, yb = Xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+                with autocast("cuda", dtype=torch.bfloat16, enabled=USE_AMP):
+                    loss = F.mse_loss(model(Xb, bathy_t, fidelity="lf"), yb) / GRAD_ACCUM_STEPS
+                scaler.scale(loss).backward()
+                if (i + 1) % GRAD_ACCUM_STEPS == 0 or (i + 1) == len(loader):
+                    scaler.unscale_(opt)
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(opt)
+                    scaler.update()
+                    opt.zero_grad()
 
-        return val_rmse(model, "fno", X_va, y_va, bathy_t, "lf")
+        result = val_rmse(model, "fno", X_va, y_va, bathy_t, "lf")
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+        return result
     return objective
 
 
-def make_objective_pino(X_tr, y_tr, X_va, y_va, bathy_t, nlat: int, nlon: int, epochs: int = 15):
+def make_objective_pino(X_tr, y_tr, X_va, y_va, bathy_t, nlat: int, nlon: int,
+                         epochs: int = 15):
     """Return an Optuna objective closure for MFPino (tunes lambda_pde too)."""
     def objective(trial):
         latent     = trial.suggest_categorical("latent_channels",    [16, 32, 64])
@@ -130,33 +188,47 @@ def make_objective_pino(X_tr, y_tr, X_va, y_va, bathy_t, nlat: int, nlon: int, e
         dec_sz     = trial.suggest_categorical("decoder_layer_size", [64, 128, 256])
         lr         = trial.suggest_float("lr",          1e-4, 5e-3, log=True)
         wd         = trial.suggest_float("wd",          1e-6, 1e-3, log=True)
-        batch      = trial.suggest_categorical("batch", [8, 16, 32])
+        batch      = trial.suggest_categorical("batch", [4, 8, 16])
         lambda_pde = trial.suggest_float("lambda_pde",  1e-4, 1e-1, log=True)
 
         model  = MFPino(nlat=nlat, nlon=nlon,
                         latent_channels=latent, num_fno_layers=layers,
                         num_fno_modes=modes, decoder_layer_size=dec_sz).to(device)
         opt    = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+        scaler = GradScaler(enabled=USE_AMP)
         loader = make_loader(X_tr, y_tr, batch)
 
         model.train()
         for _ in range(epochs):
-            for Xb, yb in loader:
-                Xb, yb = Xb.to(device), yb.to(device)
-                opt.zero_grad()
-                pred      = model(Xb, bathy_t, fidelity="lf")
-                data_loss = F.mse_loss(pred, yb)
-                phys_loss = model.pino_physics_loss(Xb, bathy_t, fidelity="lf")
-                (data_loss + lambda_pde * phys_loss).backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
+            opt.zero_grad()
+            for i, (Xb, yb) in enumerate(loader):
+                Xb, yb = Xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+                with autocast("cuda", dtype=torch.bfloat16, enabled=USE_AMP):
+                    pred      = model(Xb, bathy_t, fidelity="lf")
+                    data_loss = F.mse_loss(pred, yb)
+                    phys_loss = model.pino_physics_loss(Xb, bathy_t, fidelity="lf", pred=pred)
+                    loss      = (data_loss + lambda_pde * phys_loss) / GRAD_ACCUM_STEPS
+                scaler.scale(loss).backward()
+                if (i + 1) % GRAD_ACCUM_STEPS == 0 or (i + 1) == len(loader):
+                    scaler.unscale_(opt)
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(opt)
+                    scaler.update()
+                    opt.zero_grad()
 
-        return val_rmse(model, "fno", X_va, y_va, bathy_t, "lf")
+        result = val_rmse(model, "fno", X_va, y_va, bathy_t, "lf")
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+        return result
     return objective
 
 
-# Training loops
-def train_mf(model, model_type: str, lf_data, mf_data, hf_data, aux, best_params: dict, epochs_lf: int = 300, epochs_mf: int = 150, epochs_hf: int = 75) -> dict:
+# ── Training loops ────────────────────────────────────────────────────────────
+
+def train_mf(model, model_type: str, lf_data, mf_data, hf_data, aux,
+             best_params: dict, epochs_lf: int = 300, epochs_mf: int = 150,
+             epochs_hf: int = 75) -> dict:
     """
     3-stage multi-fidelity training for MFDeepONet or MFFno.
 
@@ -172,31 +244,44 @@ def train_mf(model, model_type: str, lf_data, mf_data, hf_data, aux, best_params
     """
     lr    = best_params.get("lr",    1e-3)
     wd    = best_params.get("wd",    1e-5)
-    batch = best_params.get("batch", 32)
+    batch = best_params.get("batch", 4)
 
     history = {k: [] for k in
                ["lf_train", "lf_val", "mf_train", "mf_val", "hf_train", "hf_val"]}
 
     def _run_stage(params, loader, val_X, val_y, fidelity, epochs, tag):
-        opt   = torch.optim.AdamW(params, lr=lr, weight_decay=wd)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+        opt    = torch.optim.AdamW(params, lr=lr, weight_decay=wd)
+        sched  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+        scaler = GradScaler(enabled=USE_AMP)
         best_val, best_state = float("inf"), None
 
         for ep in range(epochs):
             model.train()
             ep_loss = []
-            for Xb, yb in loader:
-                Xb, yb = Xb.to(device), yb.to(device)
-                opt.zero_grad()
-                pred = model(Xb, aux, fidelity=fidelity)
-                if pred.dim() == 4:
-                    pred = pred.squeeze(1)
-                    yb   = yb.squeeze(1)
-                loss = F.mse_loss(pred, yb)
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
-                ep_loss.append(loss.item() ** 0.5)
+            opt.zero_grad()
+
+            for i, (Xb, yb) in enumerate(loader):
+                Xb = Xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+
+                with autocast("cuda", dtype=torch.bfloat16, enabled=USE_AMP):
+                    pred = model(Xb, aux, fidelity=fidelity)
+                    if pred.dim() == 4:
+                        pred = pred.squeeze(1)
+                        yb   = yb.squeeze(1) if yb.dim() == 4 else yb
+                    loss = F.mse_loss(pred, yb) / GRAD_ACCUM_STEPS
+
+                # Track unscaled RMSE for logging
+                ep_loss.append((loss.item() * GRAD_ACCUM_STEPS) ** 0.5)
+                scaler.scale(loss).backward()
+
+                if (i + 1) % GRAD_ACCUM_STEPS == 0 or (i + 1) == len(loader):
+                    scaler.unscale_(opt)
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(opt)
+                    scaler.update()
+                    opt.zero_grad()
+
             sched.step()
 
             vl = val_rmse(model, model_type, val_X, val_y, aux, fidelity)
@@ -204,15 +289,19 @@ def train_mf(model, model_type: str, lf_data, mf_data, hf_data, aux, best_params
             history[f"{tag}_val"].append(vl)
 
             if vl < best_val:
-                best_val   = vl
-                best_state = {k: v.clone() for k, v in model.state_dict().items()}
+                best_val  = vl
+                # Store best checkpoint in CPU RAM — not GPU VRAM
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
             if (ep + 1) % max(1, epochs // 5) == 0:
                 print(f"  [{tag.upper()}] Ep {ep+1:3d} | "
                       f"Train RMSE: {np.mean(ep_loss):.4f} | Val RMSE: {vl:.4f}")
 
         if best_state:
-            model.load_state_dict(best_state)
+            model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+        del best_state
+        gc.collect()
+        torch.cuda.empty_cache()
 
     X_lf_tr, X_lf_va, y_lf_tr, y_lf_va = lf_data
     X_mf_tr, X_mf_va, y_mf_tr, y_mf_va = mf_data
@@ -230,7 +319,7 @@ def train_mf(model, model_type: str, lf_data, mf_data, hf_data, aux, best_params
     for p_ in (model.lf if model_type == "deeponet" else model.fno).parameters():
         p_.requires_grad = False
 
-    # Stage 2: MF correction 
+    # Stage 2: MF correction
     print("\nStage 2: MF Correction")
     mf_params = (
         list(model.mf.parameters()) + [model.alpha_mf] if model_type == "deeponet"
@@ -244,7 +333,7 @@ def train_mf(model, model_type: str, lf_data, mf_data, hf_data, aux, best_params
         p_.requires_grad = False
     model.alpha_mf.requires_grad = False
 
-    # Stage 3: HF correction 
+    # Stage 3: HF correction
     print("\nStage 3: HF Correction")
     hf_params = (
         list(model.hf.parameters()) + [model.alpha_hf] if model_type == "deeponet"
@@ -256,46 +345,66 @@ def train_mf(model, model_type: str, lf_data, mf_data, hf_data, aux, best_params
     return history
 
 
-def train_mf_pino(model: MFPino, lf_data, mf_data, hf_data, aux, best_params: dict, epochs_lf: int = 300, epochs_mf: int = 150, epochs_hf: int = 75) -> dict:
+def train_mf_pino(model: MFPino, lf_data, mf_data, hf_data, aux,
+                  best_params: dict, epochs_lf: int = 300, epochs_mf: int = 150,
+                  epochs_hf: int = 75) -> dict:
     """
     3-stage MF training for MFPino.
 
     Stage 1 (LF) : L = L_data + lambda_pde * L_physics  ← PINO active
     Stages 2 & 3 : data loss only (correction nets, LF backbone frozen)
+
+    Physics loss reuses the pre-computed pred to avoid a second forward pass.
     """
     lr         = best_params.get("lr",         1e-3)
     wd         = best_params.get("wd",         1e-5)
-    batch      = best_params.get("batch",      32)
+    batch      = best_params.get("batch",      4)
     lambda_pde = best_params.get("lambda_pde", 1e-2)
 
     history = {k: [] for k in
                ["lf_train", "lf_val", "mf_train", "mf_val", "hf_train", "hf_val"]}
 
-    def _run_stage(params, loader, val_X, val_y, fidelity, epochs, tag, physics: bool = False):
-        opt   = torch.optim.AdamW(params, lr=lr, weight_decay=wd)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    def _run_stage(params, loader, val_X, val_y, fidelity, epochs, tag,
+                   physics: bool = False):
+        opt    = torch.optim.AdamW(params, lr=lr, weight_decay=wd)
+        sched  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+        scaler = GradScaler(enabled=USE_AMP)
         best_val, best_state = float("inf"), None
 
         for ep in range(epochs):
             model.train()
             ep_loss = []
-            for Xb, yb in loader:
-                Xb, yb = Xb.to(device), yb.to(device)
-                opt.zero_grad()
-                pred      = model(Xb, aux, fidelity=fidelity)
-                if pred.dim() == 4:
-                    pred = pred.squeeze(1)
-                    yb   = yb.squeeze(1)
-                data_loss = F.mse_loss(pred, yb)
-                if physics:
-                    phys_loss = model.pino_physics_loss(Xb, aux, fidelity=fidelity)
-                    loss = data_loss + lambda_pde * phys_loss
-                else:
-                    loss = data_loss
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
-                ep_loss.append(data_loss.item() ** 0.5)  # track data RMSE only
+            opt.zero_grad()
+
+            for i, (Xb, yb) in enumerate(loader):
+                Xb = Xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+
+                with autocast("cuda", dtype=torch.bfloat16, enabled=USE_AMP):
+                    pred = model(Xb, aux, fidelity=fidelity)
+                    if pred.dim() == 4:
+                        pred = pred.squeeze(1)
+                        yb   = yb.squeeze(1) if yb.dim() == 4 else yb
+                    data_loss = F.mse_loss(pred, yb)
+                    if physics:
+                        # Pass pre-computed pred to avoid a second full forward pass
+                        phys_loss = model.pino_physics_loss(
+                            Xb, aux, fidelity=fidelity, pred=pred
+                        )
+                        loss = (data_loss + lambda_pde * phys_loss) / GRAD_ACCUM_STEPS
+                    else:
+                        loss = data_loss / GRAD_ACCUM_STEPS
+
+                ep_loss.append(data_loss.item() ** 0.5)   # track data RMSE only
+                scaler.scale(loss).backward()
+
+                if (i + 1) % GRAD_ACCUM_STEPS == 0 or (i + 1) == len(loader):
+                    scaler.unscale_(opt)
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(opt)
+                    scaler.update()
+                    opt.zero_grad()
+
             sched.step()
 
             vl = val_rmse(model, "fno", val_X, val_y, aux, fidelity)
@@ -303,15 +412,18 @@ def train_mf_pino(model: MFPino, lf_data, mf_data, hf_data, aux, best_params: di
             history[f"{tag}_val"].append(vl)
 
             if vl < best_val:
-                best_val   = vl
-                best_state = {k: v.clone() for k, v in model.state_dict().items()}
+                best_val  = vl
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
             if (ep + 1) % max(1, epochs // 5) == 0:
                 print(f"  [PINO-{tag.upper()}] Ep {ep+1:3d} | "
                       f"Data RMSE: {np.mean(ep_loss):.4f} | Val RMSE: {vl:.4f}")
 
         if best_state:
-            model.load_state_dict(best_state)
+            model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+        del best_state
+        gc.collect()
+        torch.cuda.empty_cache()
 
     X_lf_tr, X_lf_va, y_lf_tr, y_lf_va = lf_data
     X_mf_tr, X_mf_va, y_mf_tr, y_mf_va = mf_data
@@ -345,8 +457,11 @@ def train_mf_pino(model: MFPino, lf_data, mf_data, hf_data, aux, best_params: di
 
     return history
 
-# Evaluation & visualisation
-def evaluate(model, model_type: str, X_te, y_te_flat, aux, name: str, fidelity: str = "hf", inverse_fn=None, batch: int = 16) -> dict:
+
+# ── Evaluation & visualisation ────────────────────────────────────────────────
+
+def evaluate(model, model_type: str, X_te, y_te_flat, aux, name: str,
+             fidelity: str = "hf", inverse_fn=None, batch: int = 16) -> dict:
     """Run inference on the test set and compute metrics."""
     model.eval()
     preds = []
@@ -354,11 +469,12 @@ def evaluate(model, model_type: str, X_te, y_te_flat, aux, name: str, fidelity: 
     loader = make_loader(X_te, y_te_flat, batch_size=batch, shuffle=False)
     with torch.no_grad():
         for Xb, yb in loader:
-            Xb = Xb.to(device)
-            pred = model(Xb, aux, fidelity=fidelity)
-            if pred.dim() == 4:
-                pred = pred.reshape(len(Xb), -1)
-            preds.append(pred.cpu().numpy())
+            Xb = Xb.to(device, non_blocking=True)
+            with autocast("cuda", dtype=torch.bfloat16, enabled=USE_AMP):
+                pred = model(Xb, aux, fidelity=fidelity)
+                if pred.dim() == 4:
+                    pred = pred.reshape(len(Xb), -1)
+            preds.append(pred.float().cpu().numpy())
             if yb.dim() > 2:
                 trues.append(yb.reshape(len(yb), -1).cpu().numpy())
             else:
@@ -393,7 +509,8 @@ def evaluate(model, model_type: str, X_te, y_te_flat, aux, name: str, fidelity: 
                 rel_err=rel * 100, pred=pred_flat, true=true_flat)
 
 
-def plot_maps(result: dict, lon, lat, nlat: int, nlon: int, out_path: str = None, n: int = 3):
+def plot_maps(result: dict, lon, lat, nlat: int, nlon: int,
+              out_path: str = None, n: int = 3):
     """Plot true / predicted / error spatial maps for n test samples."""
     p2d = result["pred"].reshape(-1, nlat, nlon)
     t2d = result["true"].reshape(-1, nlat, nlon)

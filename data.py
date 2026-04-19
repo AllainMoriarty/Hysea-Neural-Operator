@@ -140,6 +140,18 @@ class H5FieldView:
     def __del__(self):
         self.close()
 
+    # Windows DataLoader uses 'spawn' which pickles H5FieldView objects.
+    # We must close the HDF5 handle before pickling and reopen lazily after.
+    def __getstate__(self):
+        self.close()
+        state = self.__dict__.copy()
+        state["_hf"] = None
+        state["_ds"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)  # _hf / _ds remain None; reopened on demand
+
 
 def _fit_feature_stats(path: str, chunk_size: int = 2048):
     """Compute mean/std for 'features' using a streaming pass over HDF5."""
@@ -258,9 +270,12 @@ def build_query_points(lf_raw: dict, include_spt: bool = True):
         ).astype(np.float32)
         spt_scaler = StandardScaler()
         spt_scaled = spt_scaler.fit_transform(spt_pts)
-        q_spt = torch.tensor(spt_scaled, dtype=torch.float32).to(device)
+        # q_spt stays on CPU: at 1 km grid with many timesteps the full
+        # spatio-temporal tensor (NLAT*NLON*NTIME, 3) is too large for GPU.
+        # Move slices to device inside the forward pass if needed.
+        q_spt = torch.tensor(spt_scaled, dtype=torch.float32)  # CPU
     else:
-        q_spt = torch.empty((0, 3), dtype=torch.float32, device=device)
+        q_spt = torch.empty((0, 3), dtype=torch.float32)  # CPU; no-op for non-eta tasks
     return q_sp, q_spt
 
 
@@ -351,7 +366,7 @@ class DataBundle:
     feat_scaler: Any
 
 
-def load_dataset(target: str = "all", lazy: bool = False) -> DataBundle:
+def load_dataset(target: str = "all", lazy: bool = True) -> DataBundle:
     """
     Load three-fidelity datasets, preprocess, split, and return a DataBundle.
     This is the only function in data.py that reads from disk.

@@ -8,7 +8,15 @@ Run
 ---
     uv run max_height.py
     MLFLOW_TRACKING_URI=http://my-server:5000 uv run max_height.py
+
+Memory design
+-------------
+• Only ONE model lives on GPU at a time (train → save → del → gc → next).
+• Evaluation reloads each model from its saved .pt file, evaluates, then
+  deletes it before loading the next — never holding 2+ models in VRAM.
+• Training is done via AMP + gradient accumulation in training.py.
 """
+import gc
 import numpy as np
 import pandas as pd
 import torch
@@ -65,6 +73,10 @@ def _log_results(results: list) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # ── Global torch settings ─────────────────────────────────────────────────
+    torch.backends.cudnn.benchmark = True          # auto-tune CUDNN kernels
+    torch.set_float32_matmul_precision("high")     # enable TF32 on RTX 5090
+
     print(f"Device : {device}")
     print(f"MLflow : {MLFLOW_TRACKING_URI}  |  experiment: {EXPERIMENT}")
 
@@ -78,6 +90,7 @@ if __name__ == "__main__":
     # Build SWE grid info for PINO physics loss
     lf_raw              = load_h5(DATA_PATHS["lf"], keys=["lon", "lat", "bathymetry"])
     grid_info, H_raw    = build_grid_info(lf_raw, db)
+    del lf_raw          # free raw metadata — lon/lat/bathymetry no longer needed
 
     # =========================================================================
     # HYPERPARAMETER TUNING
@@ -147,19 +160,19 @@ if __name__ == "__main__":
     print(f"Best PINO : {best_pino}")
 
     # =========================================================================
-    # TRAINING
+    # TRAINING — one model on GPU at a time
+    # Lifecycle: build → train → save → del → gc → empty_cache → next model
     # =========================================================================
 
     # ── DeepONet ──────────────────────────────────────────────────────────────
     print("\n" + "="*60 + "\nTraining MF-DeepONet: max_height")
+    don_kwargs = dict(p=best_don["p"], hidden=best_don["hidden"], trunk_dim=2)
     with mlflow.start_run(run_name="train_deeponet"):
         mlflow.set_tags({"target": TARGET, "phase": "training",
                          "model": "deeponet", "device": str(device)})
         mlflow.log_params(best_don)
 
-        don_mh = MFDeepONet(
-            p=best_don["p"], hidden=best_don["hidden"], trunk_dim=2
-        ).to(device)
+        don_mh = MFDeepONet(**don_kwargs).to(device)
         hist_don = train_mf(
             don_mh, "deeponet",
             (db.X_lf["tr"], db.X_lf["va"], db.ymh_lf["tr"], db.ymh_lf["va"]),
@@ -172,21 +185,27 @@ if __name__ == "__main__":
         torch.save(don_mh.state_dict(), "don_maxheight.pt")
         mlflow.log_artifact("don_maxheight.pt")
 
+    # Free GPU before building the next model
+    del don_mh
+    gc.collect()
+    torch.cuda.empty_cache()
+
     # ── FNO ───────────────────────────────────────────────────────────────────
     print("\n" + "="*60 + "\nTraining MF-FNO: max_height")
+    fno_kwargs = dict(
+        nlat=nlat, nlon=nlon,
+        latent_channels=best_fno["latent_channels"],
+        num_fno_layers=best_fno["num_fno_layers"],
+        num_fno_modes=best_fno["num_fno_modes"],
+        decoder_layer_size=best_fno["decoder_layer_size"],
+        out_channels=1,
+    )
     with mlflow.start_run(run_name="train_fno"):
         mlflow.set_tags({"target": TARGET, "phase": "training",
                          "model": "fno", "device": str(device)})
         mlflow.log_params(best_fno)
 
-        fno_mh = MFFno(
-            nlat=nlat, nlon=nlon,
-            latent_channels=best_fno["latent_channels"],
-            num_fno_layers=best_fno["num_fno_layers"],
-            num_fno_modes=best_fno["num_fno_modes"],
-            decoder_layer_size=best_fno["decoder_layer_size"],
-            out_channels=1,
-        ).to(device)
+        fno_mh = MFFno(**fno_kwargs).to(device)
         hist_fno = train_mf(
             fno_mh, "fno",
             (db.X_lf["tr"], db.X_lf["va"], db.ymh2d_lf["tr"], db.ymh2d_lf["va"]),
@@ -199,24 +218,29 @@ if __name__ == "__main__":
         torch.save(fno_mh.state_dict(), "fno_maxheight.pt")
         mlflow.log_artifact("fno_maxheight.pt")
 
+    del fno_mh
+    gc.collect()
+    torch.cuda.empty_cache()
+
     # ── PINO ──────────────────────────────────────────────────────────────────
     print("\n" + "="*60 + "\nTraining MF-PINO: max_height")
+    pino_kwargs = dict(
+        nlat=nlat, nlon=nlon,
+        latent_channels=best_pino["latent_channels"],
+        num_fno_layers=best_pino["num_fno_layers"],
+        num_fno_modes=best_pino["num_fno_modes"],
+        decoder_layer_size=best_pino["decoder_layer_size"],
+        out_channels=1,
+        task="max_height",
+        H_raw=H_raw,
+        grid_info=grid_info,
+    )
     with mlflow.start_run(run_name="train_pino"):
         mlflow.set_tags({"target": TARGET, "phase": "training",
                          "model": "pino", "device": str(device)})
         mlflow.log_params(best_pino)
 
-        pino_mh = MFPino(
-            nlat=nlat, nlon=nlon,
-            latent_channels=best_pino["latent_channels"],
-            num_fno_layers=best_pino["num_fno_layers"],
-            num_fno_modes=best_pino["num_fno_modes"],
-            decoder_layer_size=best_pino["decoder_layer_size"],
-            out_channels=1,
-            task="max_height",
-            H_raw=H_raw,
-            grid_info=grid_info,
-        ).to(device)
+        pino_mh = MFPino(**pino_kwargs).to(device)
         hist_pino = train_mf_pino(
             pino_mh,
             (db.X_lf["tr"], db.X_lf["va"], db.ymh2d_lf["tr"], db.ymh2d_lf["va"]),
@@ -229,8 +253,13 @@ if __name__ == "__main__":
         torch.save(pino_mh.state_dict(), "pino_maxheight.pt")
         mlflow.log_artifact("pino_maxheight.pt")
 
+    del pino_mh
+    gc.collect()
+    torch.cuda.empty_cache()
+
     # =========================================================================
-    # EVALUATION
+    # EVALUATION — reload models from disk one at a time
+    # Never hold more than one model in VRAM simultaneously.
     # =========================================================================
     print("\n" + "="*60 + "\nEvaluation")
     with mlflow.start_run(run_name="evaluation"):
@@ -241,21 +270,48 @@ if __name__ == "__main__":
         te_y_2d   = {"lf": db.ymh2d_lf["te"], "mf": db.ymh2d_mf["te"], "hf": db.ymh2d_hf["te"]}
 
         results = []
+
+        # ── Evaluate DeepONet ─────────────────────────────────────────────────
+        don_mh = MFDeepONet(**don_kwargs).to(device)
+        don_mh.load_state_dict(
+            torch.load("don_maxheight.pt", map_location=device, weights_only=True)
+        )
         for fid in ["lf", "mf", "hf"]:
             results.append(evaluate(
                 don_mh, "deeponet", te_X[fid], te_y_flat[fid],
                 db.q_sp, "MF-DeepONet max_height", fid, INVERSE_FN,
             ))
+        del don_mh
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # ── Evaluate FNO ──────────────────────────────────────────────────────
+        fno_mh = MFFno(**fno_kwargs).to(device)
+        fno_mh.load_state_dict(
+            torch.load("fno_maxheight.pt", map_location=device, weights_only=True)
+        )
         for fid in ["lf", "mf", "hf"]:
             results.append(evaluate(
                 fno_mh, "fno", te_X[fid], te_y_2d[fid],
                 db.bathy_t, "MF-FNO max_height", fid, INVERSE_FN,
             ))
+        del fno_mh
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # ── Evaluate PINO ─────────────────────────────────────────────────────
+        pino_mh = MFPino(**pino_kwargs).to(device)
+        pino_mh.load_state_dict(
+            torch.load("pino_maxheight.pt", map_location=device, weights_only=True)
+        )
         for fid in ["lf", "mf", "hf"]:
             results.append(evaluate(
                 pino_mh, "fno", te_X[fid], te_y_2d[fid],
                 db.bathy_t, "MF-PINO max_height", fid, INVERSE_FN,
             ))
+        del pino_mh
+        gc.collect()
+        torch.cuda.empty_cache()
 
         _log_results(results)
 

@@ -93,6 +93,13 @@ def swe_spatial_loss(
       eta timeseries: u = (B, NTIME, NLAT, NLON)  — each channel treated
                          as an independent spatial field.
     """
+    # Cast to float32: finite-difference stencils and element-wise products
+    # are numerically unstable in BF16/FP16.  This is safe under AMP autocast
+    # because the result (a scalar loss) is immediately accumulated in float32.
+    u       = u.float()
+    H_raw   = H_raw.float()
+    lat_rad = lat_rad.float()
+
     B, C, NLAT, NLON = u.shape
     device = u.device
 
@@ -150,6 +157,11 @@ def eikonal_loss(
     Source region (T ≈ 0) is masked out because the eikonal breaks
     down at the wavefront origin.
     """
+    # Cast to float32: see note in swe_spatial_loss.
+    T_pred  = T_pred.float()
+    H_raw   = H_raw.float()
+    lat_rad = lat_rad.float()
+
     B, _, NLAT, NLON = T_pred.shape
     device = T_pred.device
 

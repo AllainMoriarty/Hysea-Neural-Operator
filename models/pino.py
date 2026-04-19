@@ -16,8 +16,11 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from physicsnemo.models.fno.fno import FNO
+from torch.utils.checkpoint import checkpoint as _grad_ckpt
+from config import GRAD_CKPT
 
 from .swe_residuals import swe_spatial_loss, eikonal_loss
+from .fno import _SpatialDecoder   # shared grid-size-independent encoder
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -36,6 +39,8 @@ def spectral_laplacian_residual(u: torch.Tensor) -> torch.Tensor:
     -------
     Scalar tensor — ||∇²u||² averaged over B, C, H, W.
     """
+    # Always compute in float32: FFT is numerically unstable in BF16/FP16.
+    u = u.float()
     B, C, H, W = u.shape
 
     kx = torch.fft.fftfreq(W, d=1.0 / W).to(u.device)
@@ -66,6 +71,13 @@ class MFPino(nn.Module):
 
     Output: f_LF + sigmoid(α_MF)*δ_MF + sigmoid(α_HF)*δ_HF
 
+    Memory optimisations applied
+    ----------------------------
+    • feat_embed  : _SpatialDecoder instead of Linear(256, NLAT*NLON)
+    • backbone    : gradient checkpointing when GRAD_CKPT=True (training only)
+    • corrections : coord_features=False, padding=2 (halved)
+    • physics     : accepts optional pre-computed pred to avoid double forward
+
     Parameters
     ----------
     task : str
@@ -92,7 +104,7 @@ class MFPino(nn.Module):
         decoder_layer_size: int = 128,
         n_fault_params:  int = 9,
         out_channels:    int = 1,
-        # ── Physics parameters (new) ─────────────────────────────────────────
+        # ── Physics parameters ────────────────────────────────────────────────
         task: str = "max_height",
         H_raw: torch.Tensor | None = None,
         grid_info: dict | None = None,
@@ -109,9 +121,9 @@ class MFPino(nn.Module):
         else:
             self.H_raw = None
 
-        self.feat_embed = nn.Sequential(
-            nn.Linear(n_fault_params, 256), nn.GELU(),
-            nn.Linear(256, nlat * nlon),
+        # Grid-size-independent fault-param encoder (replaces Linear(256, NLAT*NLON))
+        self.feat_embed = _SpatialDecoder(
+            nlat=nlat, nlon=nlon, n_fault_params=n_fault_params,
         )
 
         # Primary PINO backbone (trained with physics loss in Stage 1)
@@ -130,12 +142,13 @@ class MFPino(nn.Module):
             coord_features=True,
         )
 
+        # Smaller correction networks — coord_features unnecessary for residuals
         _corr = dict(
             in_channels=2, out_channels=out_channels,
             decoder_layers=1, decoder_layer_size=64,
             dimension=2, latent_channels=16,
             num_fno_layers=2, num_fno_modes=8,
-            padding=4, coord_features=True,
+            padding=2, coord_features=False,
         )
         self.mf_correction = FNO(**_corr)
         self.hf_correction = FNO(**_corr)
@@ -146,15 +159,20 @@ class MFPino(nn.Module):
 
     def _build_input(self, fault_params: torch.Tensor,
                      bathy_t: torch.Tensor) -> torch.Tensor:
-        B    = fault_params.shape[0]
-        feat = self.feat_embed(fault_params).view(B, 1, self.nlat, self.nlon)
-        bathy = bathy_t.unsqueeze(0).unsqueeze(0).expand(B, 1, -1, -1)
+        feat  = self.feat_embed(fault_params)                          # (B, 1, NLAT, NLON)
+        bathy = bathy_t.unsqueeze(0).unsqueeze(0).expand(feat.shape[0], 1, -1, -1)
         return torch.cat([feat, bathy], dim=1)
 
     def forward(self, fault_params: torch.Tensor, bathy_t: torch.Tensor,
                 fidelity: str = "hf") -> torch.Tensor:
-        x      = self._build_input(fault_params, bathy_t)
-        lf_out = self.fno(x)
+        x = self._build_input(fault_params, bathy_t)
+
+        # Gradient checkpointing on the primary backbone saves ~60 % activation VRAM
+        if GRAD_CKPT and self.training:
+            lf_out = _grad_ckpt(self.fno, x, use_reentrant=False)
+        else:
+            lf_out = self.fno(x)
+
         if fidelity == "lf":
             return lf_out
         mf_out = lf_out + torch.sigmoid(self.alpha_mf) * self.mf_correction(x)
@@ -167,7 +185,8 @@ class MFPino(nn.Module):
 
     def pino_physics_loss(self, fault_params: torch.Tensor,
                           bathy_t: torch.Tensor,
-                          fidelity: str = "lf") -> torch.Tensor:
+                          fidelity: str = "lf",
+                          pred: torch.Tensor | None = None) -> torch.Tensor:
         """
         Hybrid SWE physics constraint.
 
@@ -177,8 +196,15 @@ class MFPino(nn.Module):
           eta           → swe_spatial_loss() ∇·(gH·∇u) = 0    [linearised SWE]
 
         Falls back to spectral Laplacian if H_raw / grid_info not provided.
+
+        Parameters
+        ----------
+        pred : optional pre-computed forward output.
+            Pass the tensor already returned by forward() to avoid a second
+            full forward pass (saves ~50 % compute in Stage 1 PINO training).
         """
-        pred = self.forward(fault_params, bathy_t, fidelity=fidelity)
+        if pred is None:
+            pred = self.forward(fault_params, bathy_t, fidelity=fidelity)
 
         gi = self.grid_info
         if self.H_raw is None or not gi:
