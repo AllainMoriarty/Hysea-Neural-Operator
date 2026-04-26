@@ -76,9 +76,35 @@ def make_loader(X, y, batch_size: int, shuffle: bool = True) -> DataLoader:
     )
 
 
+def _ensure_aux_device(aux, model_type: str):
+    """Move DeepONet query tensors to the compute device if needed."""
+    if model_type == "deeponet" and isinstance(aux, torch.Tensor):
+        return aux.to(device, non_blocking=True)
+    return aux
+
+
+def _infer_out_channels(y) -> int:
+    """Infer FNO/PINO output channels from target sample shape."""
+    sample = y[0]
+    if isinstance(sample, torch.Tensor):
+        sample = sample.detach().cpu().numpy()
+    else:
+        sample = np.asarray(sample)
+
+    # y sample shapes:
+    #   (H, W)       -> scalar field
+    #   (C, H, W)    -> multi-channel field (e.g. eta with C=NTIME)
+    if sample.ndim == 2:
+        return 1
+    if sample.ndim == 3:
+        return int(sample.shape[0])
+    return 1
+
+
 def val_rmse(model, model_type: str, X_val, y_val, aux, fidelity: str,
              batch: int = 32) -> float:
     model.eval()
+    aux = _ensure_aux_device(aux, model_type)
     losses = []
     loader = make_loader(X_val, y_val, batch_size=batch, shuffle=False)
     with torch.no_grad():
@@ -109,6 +135,7 @@ def make_objective_deeponet(X_tr, y_tr, X_va, y_va, q, trunk_dim: int = 2,
         batch  = trial.suggest_categorical("batch",  [16, 32, 64])
 
         model  = MFDeepONet(p=p, hidden=hidden, trunk_dim=trunk_dim).to(device)
+        q_dev  = _ensure_aux_device(q, "deeponet")
         opt    = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
         scaler = GradScaler(enabled=USE_AMP)
         loader = make_loader(X_tr, y_tr, batch)
@@ -119,7 +146,7 @@ def make_objective_deeponet(X_tr, y_tr, X_va, y_va, q, trunk_dim: int = 2,
             for i, (Xb, yb) in enumerate(loader):
                 Xb, yb = Xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
                 with autocast("cuda", dtype=torch.bfloat16, enabled=USE_AMP):
-                    loss = F.mse_loss(model(Xb, q, fidelity="lf"), yb) / GRAD_ACCUM_STEPS
+                    loss = F.mse_loss(model(Xb, q_dev, fidelity="lf"), yb) / GRAD_ACCUM_STEPS
                 scaler.scale(loss).backward()
                 if (i + 1) % GRAD_ACCUM_STEPS == 0 or (i + 1) == len(loader):
                     scaler.unscale_(opt)
@@ -128,7 +155,7 @@ def make_objective_deeponet(X_tr, y_tr, X_va, y_va, q, trunk_dim: int = 2,
                     scaler.update()
                     opt.zero_grad()
 
-        result = val_rmse(model, "deeponet", X_va, y_va, q, "lf")
+        result = val_rmse(model, "deeponet", X_va, y_va, q_dev, "lf")
         del model
         gc.collect()
         torch.cuda.empty_cache()
@@ -154,10 +181,12 @@ def make_objective_fno(X_tr, y_tr, X_va, y_va, bathy_t, nlat: int, nlon: int,
         lr     = trial.suggest_float("lr", 1e-4, 5e-3, log=True)
         wd     = trial.suggest_float("wd", 1e-6, 1e-3, log=True)
         batch  = trial.suggest_categorical("batch", [2, 4])
+        out_channels = _infer_out_channels(y_tr)
 
         model  = MFFno(nlat=nlat, nlon=nlon,
                        latent_channels=latent, num_fno_layers=layers,
-                       num_fno_modes=modes, decoder_layer_size=dec_sz).to(device)
+                   num_fno_modes=modes, decoder_layer_size=dec_sz,
+                   out_channels=out_channels).to(device)
         opt    = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
         scaler = GradScaler(enabled=USE_AMP)
         loader = make_loader(X_tr, y_tr, batch)
@@ -202,10 +231,12 @@ def make_objective_pino(X_tr, y_tr, X_va, y_va, bathy_t, nlat: int, nlon: int,
         wd         = trial.suggest_float("wd",          1e-6, 1e-3, log=True)
         batch      = trial.suggest_categorical("batch", [2, 4])
         lambda_pde = trial.suggest_float("lambda_pde",  1e-4, 1e-1, log=True)
+        out_channels = _infer_out_channels(y_tr)
 
         model  = MFPino(nlat=nlat, nlon=nlon,
                         latent_channels=latent, num_fno_layers=layers,
-                        num_fno_modes=modes, decoder_layer_size=dec_sz).to(device)
+                num_fno_modes=modes, decoder_layer_size=dec_sz,
+                out_channels=out_channels).to(device)
         opt    = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
         scaler = GradScaler(enabled=USE_AMP)
         loader = make_loader(X_tr, y_tr, batch)
@@ -257,6 +288,7 @@ def train_mf(model, model_type: str, lf_data, mf_data, hf_data, aux,
     lr    = best_params.get("lr",    1e-3)
     wd    = best_params.get("wd",    1e-5)
     batch = best_params.get("batch", 4)
+    aux = _ensure_aux_device(aux, model_type)
 
     history = {k: [] for k in
                ["lf_train", "lf_val", "mf_train", "mf_val", "hf_train", "hf_val"]}
@@ -480,6 +512,7 @@ def evaluate(model, model_type: str, X_te, y_te_flat, aux, name: str,
              fidelity: str = "hf", inverse_fn=None, batch: int = 16) -> dict:
     """Run inference on the test set and compute metrics."""
     model.eval()
+    aux = _ensure_aux_device(aux, model_type)
     preds = []
     trues = []
     loader = make_loader(X_te, y_te_flat, batch_size=batch, shuffle=False)

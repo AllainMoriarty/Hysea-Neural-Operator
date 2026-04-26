@@ -67,6 +67,28 @@ if __name__ == "__main__":
     db   = load_dataset(target="arrival_times", lazy=True)
     nlat, nlon = db.NLAT, db.NLON
 
+    expected_npts = nlat * nlon
+    if db.q_sp.shape[0] != expected_npts:
+        raise ValueError(
+            f"q_sp has {db.q_sp.shape[0]} points, expected {expected_npts} from NLAT*NLON"
+        )
+
+    for fid in ["lf", "mf", "hf"]:
+        y_flat = getattr(db, f"yat_{fid}")["tr"][0]
+        y_2d = getattr(db, f"yat2d_{fid}")["tr"][0]
+
+        flat_width = y_flat.shape[-1] if y_flat.ndim > 1 else y_flat.shape[0]
+        if flat_width != expected_npts:
+            raise ValueError(
+                f"yat_{fid} width {flat_width} does not match expected {expected_npts}"
+            )
+
+        spatial_hw = y_2d.shape[-2:]
+        if spatial_hw != (nlat, nlon):
+            raise ValueError(
+                f"yat2d_{fid} shape {spatial_hw} does not match expected {(nlat, nlon)}"
+            )
+
     # Build SWE grid info for PINO eikonal physics loss
     lf_raw              = load_h5(DATA_PATHS["lf"], keys=["lon", "lat", "bathymetry"])
     grid_info, H_raw    = build_grid_info(lf_raw, db)

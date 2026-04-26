@@ -36,10 +36,10 @@ def mock_load_dataset(*args, **kwargs):
 data.load_dataset = mock_load_dataset
 
 print("=" * 60)
-print("STARTING DRY RUN OF arrival_times.py")
+print("STARTING DRY RUN OF eta_timeseries.py")
 print("This will execute 1 trial, 1 epoch per fidelity, on tiny subsets.")
 print("It should only take 1-3 minutes in total.")
 print("=" * 60)
 
-# 4. Execute arrival_times.py exactly as if run directly.
-runpy.run_path("arrival_times.py", run_name="__main__")
+# 4. Execute eta_timeseries.py exactly as if run directly.
+runpy.run_path("eta_timeseries.py", run_name="__main__")

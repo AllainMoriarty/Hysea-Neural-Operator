@@ -21,7 +21,9 @@ def load_h5(path: str, keys: list[str] | None = None) -> dict:
 
 
 def preprocess(data: dict, feat_scaler=None, fit: bool = False, target: str = "all",
-               mh_out_hw: tuple[int, int] | None = None):
+               mh_out_hw: tuple[int, int] | None = None,
+               at_out_hw: tuple[int, int] | None = None,
+               eta_out_hw: tuple[int, int] | None = None):
     """
     Scale features and normalise targets.
 
@@ -57,14 +59,14 @@ def preprocess(data: dict, feat_scaler=None, fit: bool = False, target: str = "a
         out["ymh2d"] = np.log1p(np.clip(mh, 0, 50)).astype(np.float32)[:, None]
 
     if target in ("all", "arrival_times"):
-        at = data["arrival_times"].astype(np.float32)
+        at = _resize_2d_fields(data["arrival_times"], at_out_hw)
         at_max = float(at.max())
         out["at_max"] = at_max
         out["yat"]   = (at.reshape(N, -1) / (at_max + 1e-8)).astype(np.float32)
         out["yat2d"] = (at / (at_max + 1e-8)).astype(np.float32)[:, None]
 
     if target in ("all", "eta"):
-        eta = data["eta"].astype(np.float32)
+        eta = _resize_3d_fields(data["eta"], eta_out_hw)
         eta_max = float(np.abs(eta).max())
         out["eta_max"] = eta_max
         out["yeta"]   = (eta.reshape(N, -1) / (eta_max + 1e-8)).astype(np.float32)
@@ -213,6 +215,39 @@ def _resize_2d_fields(arr, out_hw: tuple[int, int] | None, chunk_size: int = 64)
     raise ValueError(f"Expected 2D or 3D max_height array, got shape {y.shape}")
 
 
+def _resize_3d_fields(arr, out_hw: tuple[int, int] | None, chunk_size: int = 16):
+    """
+    Resize 3-D fields over spatial dimensions (H, W), preserving channels.
+
+    Accepted shapes:
+      (C, H, W)      single sample with channels (e.g., NTIME)
+      (N, C, H, W)   batched samples
+    """
+    y = np.asarray(arr, dtype=np.float32)
+    if out_hw is None:
+        return np.ascontiguousarray(y, dtype=np.float32)
+
+    out_h, out_w = out_hw
+    if y.ndim == 3:
+        if y.shape[-2:] == (out_h, out_w):
+            return np.ascontiguousarray(y, dtype=np.float32)
+        t = torch.from_numpy(y).unsqueeze(0)  # (1, C, H, W)
+        r = F.interpolate(t, size=out_hw, mode="bilinear", align_corners=False)
+        return np.ascontiguousarray(r.squeeze(0).cpu().numpy(), dtype=np.float32)
+
+    if y.ndim == 4:
+        if y.shape[-2:] == (out_h, out_w):
+            return np.ascontiguousarray(y, dtype=np.float32)
+        out = np.empty((y.shape[0], y.shape[1], out_h, out_w), dtype=np.float32)
+        for i in range(0, y.shape[0], chunk_size):
+            blk = torch.from_numpy(y[i:i + chunk_size])
+            rb = F.interpolate(blk, size=out_hw, mode="bilinear", align_corners=False)
+            out[i:i + chunk_size] = rb.cpu().numpy().astype(np.float32, copy=False)
+        return np.ascontiguousarray(out, dtype=np.float32)
+
+    raise ValueError(f"Expected 3D or 4D eta array, got shape {y.shape}")
+
+
 def _transform_mh_flat_factory(out_hw: tuple[int, int] | None = None):
     def _transform(arr):
         y = _resize_2d_fields(arr, out_hw)
@@ -233,18 +268,18 @@ def _transform_mh_2d_factory(out_hw: tuple[int, int] | None = None):
     return _transform
 
 
-def _transform_at_flat_factory(scale: float):
+def _transform_at_flat_factory(scale: float, out_hw: tuple[int, int] | None = None):
     def _transform(arr):
-        y = np.asarray(arr, dtype=np.float32)
+        y = _resize_2d_fields(arr, out_hw)
         if y.ndim == 2:
             return (y.reshape(-1) / (scale + 1e-8)).astype(np.float32)
         return (y.reshape(y.shape[0], -1) / (scale + 1e-8)).astype(np.float32)
     return _transform
 
 
-def _transform_at_2d_factory(scale: float):
+def _transform_at_2d_factory(scale: float, out_hw: tuple[int, int] | None = None):
     def _transform(arr):
-        y = np.asarray(arr, dtype=np.float32)
+        y = _resize_2d_fields(arr, out_hw)
         y = (y / (scale + 1e-8)).astype(np.float32)
         if y.ndim == 2:
             return y[None, ...]
@@ -252,18 +287,18 @@ def _transform_at_2d_factory(scale: float):
     return _transform
 
 
-def _transform_eta_flat_factory(scale: float):
+def _transform_eta_flat_factory(scale: float, out_hw: tuple[int, int] | None = None):
     def _transform(arr):
-        y = np.asarray(arr, dtype=np.float32)
+        y = _resize_3d_fields(arr, out_hw)
         if y.ndim == 3:
             return (y.reshape(-1) / (scale + 1e-8)).astype(np.float32)
         return (y.reshape(y.shape[0], -1) / (scale + 1e-8)).astype(np.float32)
     return _transform
 
 
-def _transform_eta_2d_factory(scale: float):
+def _transform_eta_2d_factory(scale: float, out_hw: tuple[int, int] | None = None):
     def _transform(arr):
-        y = np.asarray(arr, dtype=np.float32)
+        y = _resize_3d_fields(arr, out_hw)
         return (y / (scale + 1e-8)).astype(np.float32)
     return _transform
 
@@ -440,6 +475,12 @@ def load_dataset(target: str = "all", lazy: bool = True) -> DataBundle:
             if target == "max_height":
                 mf_nlat, mf_nlon = hf_mf["max_height"].shape[-2:]
                 hf_nlat, hf_nlon = hf_hf["max_height"].shape[-2:]
+            elif target == "arrival_times":
+                mf_nlat, mf_nlon = hf_mf["arrival_times"].shape[-2:]
+                hf_nlat, hf_nlon = hf_hf["arrival_times"].shape[-2:]
+            elif target == "eta":
+                mf_nlat, mf_nlon = hf_mf["eta"].shape[-2:]
+                hf_nlat, hf_nlon = hf_hf["eta"].shape[-2:]
             else:
                 mf_nlat = hf_nlat = NLAT
                 mf_nlon = hf_nlon = NLON
@@ -485,10 +526,16 @@ def load_dataset(target: str = "all", lazy: bool = True) -> DataBundle:
         print("Loading datasets…")
         print(f"LF:{n_lf}  MF:{n_mf}  HF:{n_hf}")
         print(f"Grid: ({NLAT}×{NLON})  Time steps: {NTIME}")
-        if target == "max_height":
-            print("Native max_height grids: "
-                  f"LF({NLAT}×{NLON})  MF({mf_nlat}×{mf_nlon})  HF({hf_nlat}×{hf_nlon})")
-            print(f"Canonical max_height grid: LF ({NLAT}×{NLON})")
+        if target in ("max_height", "arrival_times", "eta"):
+            label_map = {
+                "max_height": "max_height",
+                "arrival_times": "arrival_times",
+                "eta": "eta",
+            }
+            label = label_map[target]
+            print(f"Native {label} grids: "
+              f"LF({NLAT}×{NLON})  MF({mf_nlat}×{mf_nlon})  HF({hf_nlat}×{hf_nlon})")
+            print(f"Canonical {label} grid: LF ({NLAT}×{NLON})")
         print(f"LF  train:{len(lf_tr)}  val:{len(lf_va)}  test:{len(lf_te)}")
         print(f"MF  train:{len(mf_tr)}  val:{len(mf_va)}  test:{len(mf_te)}")
         print(f"HF  train:{len(hf_tr)}  val:{len(hf_va)}  test:{len(hf_te)}")
@@ -512,12 +559,13 @@ def load_dataset(target: str = "all", lazy: bool = True) -> DataBundle:
             yeta_lf = yeta_mf = yeta_hf = e()
             yeta2d_lf = yeta2d_mf = yeta2d_hf = e()
         elif target == "arrival_times":
-            at_tf_lf_f = _transform_at_flat_factory(at_lf)
-            at_tf_mf_f = _transform_at_flat_factory(at_mf)
-            at_tf_hf_f = _transform_at_flat_factory(at_hf)
-            at_tf_lf_2 = _transform_at_2d_factory(at_lf)
-            at_tf_mf_2 = _transform_at_2d_factory(at_mf)
-            at_tf_hf_2 = _transform_at_2d_factory(at_hf)
+            canonical_hw = (NLAT, NLON)
+            at_tf_lf_f = _transform_at_flat_factory(at_lf, canonical_hw)
+            at_tf_mf_f = _transform_at_flat_factory(at_mf, canonical_hw)
+            at_tf_hf_f = _transform_at_flat_factory(at_hf, canonical_hw)
+            at_tf_lf_2 = _transform_at_2d_factory(at_lf, canonical_hw)
+            at_tf_mf_2 = _transform_at_2d_factory(at_mf, canonical_hw)
+            at_tf_hf_2 = _transform_at_2d_factory(at_hf, canonical_hw)
             yat_lf = _pack_views(DATA_PATHS["lf"], lf_tr, lf_va, lf_te, "arrival_times", at_tf_lf_f)
             yat_mf = _pack_views(DATA_PATHS["mf"], mf_tr, mf_va, mf_te, "arrival_times", at_tf_mf_f)
             yat_hf = _pack_views(DATA_PATHS["hf"], hf_tr, hf_va, hf_te, "arrival_times", at_tf_hf_f)
@@ -529,12 +577,13 @@ def load_dataset(target: str = "all", lazy: bool = True) -> DataBundle:
             yeta_lf = yeta_mf = yeta_hf = e()
             yeta2d_lf = yeta2d_mf = yeta2d_hf = e()
         else:
-            eta_tf_lf_f = _transform_eta_flat_factory(eta_lf)
-            eta_tf_mf_f = _transform_eta_flat_factory(eta_mf)
-            eta_tf_hf_f = _transform_eta_flat_factory(eta_hf)
-            eta_tf_lf_2 = _transform_eta_2d_factory(eta_lf)
-            eta_tf_mf_2 = _transform_eta_2d_factory(eta_mf)
-            eta_tf_hf_2 = _transform_eta_2d_factory(eta_hf)
+            canonical_hw = (NLAT, NLON)
+            eta_tf_lf_f = _transform_eta_flat_factory(eta_lf, canonical_hw)
+            eta_tf_mf_f = _transform_eta_flat_factory(eta_mf, canonical_hw)
+            eta_tf_hf_f = _transform_eta_flat_factory(eta_hf, canonical_hw)
+            eta_tf_lf_2 = _transform_eta_2d_factory(eta_lf, canonical_hw)
+            eta_tf_mf_2 = _transform_eta_2d_factory(eta_mf, canonical_hw)
+            eta_tf_hf_2 = _transform_eta_2d_factory(eta_hf, canonical_hw)
             yeta_lf = _pack_views(DATA_PATHS["lf"], lf_tr, lf_va, lf_te, "eta", eta_tf_lf_f)
             yeta_mf = _pack_views(DATA_PATHS["mf"], mf_tr, mf_va, mf_te, "eta", eta_tf_mf_f)
             yeta_hf = _pack_views(DATA_PATHS["hf"], hf_tr, hf_va, hf_te, "eta", eta_tf_hf_f)
@@ -601,8 +650,13 @@ def load_dataset(target: str = "all", lazy: bool = True) -> DataBundle:
         _, _, NLAT, NLON = lf_raw["eta"].shape
     NTIME = int(len(lf_raw["time"]))
     mh_out_hw = (NLAT, NLON) if target in ("all", "max_height") else None
+    at_out_hw = (NLAT, NLON) if target in ("all", "arrival_times") else None
+    eta_out_hw = (NLAT, NLON) if target in ("all", "eta") else None
 
-    lf_proc   = preprocess(lf_raw, fit=True, target=target, mh_out_hw=mh_out_hw)
+    lf_proc   = preprocess(
+        lf_raw, fit=True, target=target,
+        mh_out_hw=mh_out_hw, at_out_hw=at_out_hw, eta_out_hw=eta_out_hw
+    )
     s_lf_map  = _split_processed(lf_proc)
     feat_scaler = lf_proc["feat_scaler"]
     at_lf, eta_lf = float(lf_proc["at_max"]), float(lf_proc["eta_max"])
@@ -619,7 +673,11 @@ def load_dataset(target: str = "all", lazy: bool = True) -> DataBundle:
     # MF
     mf_raw = load_h5(DATA_PATHS["mf"], keys=["features", *target_keys])
     mf_hw = tuple(mf_raw["max_height"].shape[-2:]) if "max_height" in mf_raw else None
-    mf_proc  = preprocess(mf_raw, feat_scaler=feat_scaler, target=target, mh_out_hw=mh_out_hw)
+    mf_eta_hw = tuple(mf_raw["eta"].shape[-2:]) if "eta" in mf_raw else None
+    mf_proc  = preprocess(
+        mf_raw, feat_scaler=feat_scaler, target=target,
+        mh_out_hw=mh_out_hw, at_out_hw=at_out_hw, eta_out_hw=eta_out_hw
+    )
     s_mf_map = _split_processed(mf_proc)
     at_mf, eta_mf = float(mf_proc["at_max"]), float(mf_proc["eta_max"])
     n_mf = mf_proc["X"].shape[0]
@@ -630,7 +688,11 @@ def load_dataset(target: str = "all", lazy: bool = True) -> DataBundle:
     # HF
     hf_raw = load_h5(DATA_PATHS["hf"], keys=["features", *target_keys])
     hf_hw = tuple(hf_raw["max_height"].shape[-2:]) if "max_height" in hf_raw else None
-    hf_proc  = preprocess(hf_raw, feat_scaler=feat_scaler, target=target, mh_out_hw=mh_out_hw)
+    hf_eta_hw = tuple(hf_raw["eta"].shape[-2:]) if "eta" in hf_raw else None
+    hf_proc  = preprocess(
+        hf_raw, feat_scaler=feat_scaler, target=target,
+        mh_out_hw=mh_out_hw, at_out_hw=at_out_hw, eta_out_hw=eta_out_hw
+    )
     s_hf_map = _split_processed(hf_proc)
     at_hf, eta_hf = float(hf_proc["at_max"]), float(hf_proc["eta_max"])
     n_hf = hf_proc["X"].shape[0]
@@ -644,6 +706,10 @@ def load_dataset(target: str = "all", lazy: bool = True) -> DataBundle:
         print("Native max_height grids: "
               f"LF({NLAT}×{NLON})  MF({mf_hw[0]}×{mf_hw[1]})  HF({hf_hw[0]}×{hf_hw[1]})")
         print(f"Canonical max_height grid: LF ({NLAT}×{NLON})")
+    if target in ("all", "eta") and mf_eta_hw is not None and hf_eta_hw is not None:
+        print("Native eta grids: "
+              f"LF({NLAT}×{NLON})  MF({mf_eta_hw[0]}×{mf_eta_hw[1]})  HF({hf_eta_hw[0]}×{hf_eta_hw[1]})")
+        print(f"Canonical eta grid: LF ({NLAT}×{NLON})")
     print(f"LF  train:{len(s_lf_map['X']['tr'])}  val:{len(s_lf_map['X']['va'])}  test:{len(s_lf_map['X']['te'])}")
     print(f"MF  train:{len(s_mf_map['X']['tr'])}  val:{len(s_mf_map['X']['va'])}  test:{len(s_mf_map['X']['te'])}")
     print(f"HF  train:{len(s_hf_map['X']['tr'])}  val:{len(s_hf_map['X']['va'])}  test:{len(s_hf_map['X']['te'])}")
